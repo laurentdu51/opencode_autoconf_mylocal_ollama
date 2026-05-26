@@ -35,3 +35,5 @@ OPENCODE_CONFIG=./opencode.json opencode
 - Ollama en cours d'exécution sur le serveur cible (port 11434)
 - `curl`, `python3` (ou `jq`) installés
 - `opencode` installé
+
+> Configuré pour utiliser le credential store Git.
