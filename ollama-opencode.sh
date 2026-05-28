@@ -123,11 +123,12 @@ fi
 # ── display & select ─────────────────────────────────────
 COUNT=$(echo "$MODELS" | grep -c . || true)
 log "Found ${COUNT} model(s):"
+i=0
 echo "$MODELS" | while read -r m; do
-  printf "  \033[1;36m•\033[0m %s\n" "$m" >&2
-done
-
-echo
+  ((++i))
+  [ $i -eq 1 ] && first=1
+  printf "  \033[1;36m%02d.\033[0m %s\n" "$i" "$m"
+done && echo
 
 # Filter out embedding-only models
 GENERATIVE_MODELS=$(echo "$MODELS" | grep -iv "embed\|nomic-embed" || true)
@@ -146,13 +147,36 @@ SMALL=$(echo "$GENERATIVE_MODELS" | while read -r m; do clean_name "$m"; done | 
 
 [ -z "$SMALL" ] && SMALL="$PRIMARY"
 
-# Allow interactive override
-if [ -t 0 ]; then
-  log "Primary model   [${PRIMARY}]: "
-  read -r ans; PRIMARY="${ans:-$PRIMARY}"
+# Build indexed array of model names
+MAP=()
+idx=0
+for m in $(echo "$GENERATIVE_MODELS" | while read -r m; do clean_name "$m"; done); do
+  MAP[$idx]="$m"
+  ((++idx))
+done
 
-  log "Small model     [${SMALL}]: "
-  read -r ans; SMALL="${ans:-$SMALL}"
+# Allow interactive override with numeric index
+if [ -t 0 ]; then
+  while true; do
+    log "Enter index (${PRIMARY:+primary=${MAP[$(($(echo "$GENERATIVE_MODELS" | grep -v "embed\|nomic-embed" | grep -iE 'coder|code|llama3|qwen3|qwen2|tinyllama'|head -1)+1) if [ -n "${PRIMARY^^} ]]; then PRIMARY_NAME="${MAP[$PRIMARY]}; echo "${PRIMARY_NAME:0:5}" ; else echo "${PRIMARY}"; fi)"}) or 'q' to quit): "
+    read -r ans
+    [[ "$ans" == "q" ]] && break
+    [[ ! "$ans" =~ ^[0-9]+$ ]] && continue
+    opt_idx=$((ans + 0))
+    [[ $opt_idx -lt 1 || $opt_idx -gt $idx ]] && { log "Invalid index"; continue; }
+    case "$ans" in
+      1|2|3) PRIMARY="${MAP[$((opt_idx - 1))]}" ;;
+      4) 
+        log "Select primary model? [yes]"
+        read -r yesno
+        [[ "$yesno" != "y" && "$yesno" != "Y" ]] && { PRIMARY="${MAP[$((idx - 1))]}"; continue; }
+        ;;
+      5|6|7)
+        SMALL="${MAP[$((opt_idx - 1))]}"
+        ;;
+    esac
+    break
+  done
 fi
 
 # ── write config ──────────────────────────────────────────
