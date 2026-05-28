@@ -130,53 +130,135 @@ echo "$MODELS" | while read -r m; do
   printf "  \033[1;36m%02d.\033[0m %s\n" "$i" "$m"
 done && echo
 
-# Filter out embedding-only models
-GENERATIVE_MODELS=$(echo "$MODELS" | grep -iv "embed\|nomic-embed" || true)
-[ -z "$GENERATIVE_MODELS" ] && GENERATIVE_MODELS="$MODELS"
+# ── detect model type ────────────────────────────────────────────────
+detect_type() {
+  local m="$1"
+  local name=$(clean_name "$m")
+  # Check model name patterns
+  if [[ "$name" =~ (llama|qwen|codellama|phi|granite|mistral) ]] && [[ "$name" != *embed* ]]; then
+    echo "generative"
+  elif [[ "$name" =~ (embed|nomic) ]]; then
+    echo "embedding"
+  elif [[ "$name" =~ coder ]]; then
+    echo "generative"
+  else
+    echo "ambiguous"
+  fi
+}
 
-# Choose primary model (prefer code models)
-PREFERRED=""
-for kw in "coder" "code" "llama3" "qwen3" "qwen2" "tinyllama"; do
-  candidate=$(echo "$GENERATIVE_MODELS" | grep -i "$kw" | head -1)
-  [ -n "$candidate" ] && { PREFERRED=$(clean_name "$candidate"); break; }
-done
-PRIMARY="${PREFERRED:-$(echo "$GENERATIVE_MODELS" | head -1 | while read -r m; do clean_name "$m"; done)}"
+# ── classify models ───────────────────────────────────────────────────
+MODELS_WITH_TYPES=$(echo "$MODELS" | while read -r m; do echo "0\t$m"; done | paste -d'\t' <(seq 1 1))
+CLASSIFIED=$(echo "$MODELS_WITH_TYPES" | while IFS=$'\t' read -r idx m; do
+  type=$(detect_type "$m")
+  case "$type" in
+    generative) echo "$idx\tgenerative\t$m" ;;
+    embedding) echo "$idx\tembedding\t$m" ;;
+    *)         echo "$idx\tambiguous\t$m" ;;
+  esac
+done)
 
-# Small model: pick the smallest model by parameter size (heuristic via version sort on tag)
-SMALL=$(echo "$GENERATIVE_MODELS" | while read -r m; do clean_name "$m"; done | sort -t: -k2 -V | head -1)
-
-[ -z "$SMALL" ] && SMALL="$PRIMARY"
-
-# Build indexed array of model names
-MAP=()
+# ── build indexed array ───────────────────────────────────────────────
+declare -A TYPE_MAP
+declare -a ALL_MODELS
 idx=0
-for m in $(echo "$GENERATIVE_MODELS" | while read -r m; do clean_name "$m"; done); do
-  MAP[$idx]="$m"
+while IFS=$'\t' read -r i type name; do
+  ALL_MODELS[$idx]="$name"
+  TYPE_MAP[$idx]="$type"
   ((++idx))
+done <<< "$CLASSIFIED"
+
+# ── select models ────────────────────────────────────────────────────
+# Generative model takes priority
+GEN_INDICES=()
+EMB_INDICES=()
+for ((i=0; i<${#ALL_MODELS[@]}; i++)); do
+  type="${TYPE_MAP[$i]}"
+  case "$type" in
+    generative) GEN_INDICES+=($i) ;;
+    embedding) EMB_INDICES+=($i) ;;
+  esac
 done
 
-# Allow interactive override with numeric index
-if [ -t 0 ]; then
-  while true; do
-    log "Enter index (${PRIMARY:+primary=${MAP[$(($(echo "$GENERATIVE_MODELS" | grep -v "embed\|nomic-embed" | grep -iE 'coder|code|llama3|qwen3|qwen2|tinyllama'|head -1)+1) if [ -n "${PRIMARY^^} ]]; then PRIMARY_NAME="${MAP[$PRIMARY]}; echo "${PRIMARY_NAME:0:5}" ; else echo "${PRIMARY}"; fi)"}) or 'q' to quit): "
-    read -r ans
-    [[ "$ans" == "q" ]] && break
-    [[ ! "$ans" =~ ^[0-9]+$ ]] && continue
-    opt_idx=$((ans + 0))
-    [[ $opt_idx -lt 1 || $opt_idx -gt $idx ]] && { log "Invalid index"; continue; }
-    case "$ans" in
-      1|2|3) PRIMARY="${MAP[$((opt_idx - 1))]}" ;;
-      4) 
-        log "Select primary model? [yes]"
-        read -r yesno
-        [[ "$yesno" != "y" && "$yesno" != "Y" ]] && { PRIMARY="${MAP[$((idx - 1))]}"; continue; }
-        ;;
-      5|6|7)
-        SMALL="${MAP[$((opt_idx - 1))]}"
-        ;;
-    esac
-    break
+# Auto-select primary: generative (prefer recent one)
+if [[ $GEN_COUNT -gt 0 ]]; then
+  # Prefer models with "3", "2", "latest" in the name (more recent)
+  best_idx=0
+  for ((i=0; i<GEN_COUNT; i++)); do
+    curr_idx=$i
+    [[ -z "${GEN_INDICES[$curr_idx]}" ]] && continue
+    curr="${ALL_MODELS[${GEN_INDICES[$curr_idx]}]}"
+    if [[ "$curr" == *"3"* || "$curr" == *"2"* || "$curr" == *"latest"* ]]; then
+      # Check if this is the best so far
+      best_idx=$curr_idx
+    fi
   done
+  PRIMARY="${ALL_MODELS[${GEN_INDICES[$best_idx]}]}"
+else
+  PRIMARY="${ALL_MODELS[${EMB_INDICES[0]}]}"
+fi
+
+# Select small: generative if possible, otherwise from embedding
+SMALL_MODEL=""
+SMALL_IDX=-1
+for ((i=0; i<${#GEN_INDICES[@]}; i++)); do
+  idx=${GEN_INDICES[$i]}
+  if [[ $idx -ne $PRIMARY_IDX ]]; then
+    SMALL="${ALL_MODELS[$idx]}"
+    SMALL_IDX=$idx
+    break
+  fi
+done
+if [[ -z "$SMALL" ]] || [[ -1 == $SMALL_IDX ]]; then
+  for ((i=0; i<${#EMB_INDICES[@]}; i++)); do
+    idx=$i
+    if [[ -z "$SMALL" ]]; then
+      SMALL="${ALL_MODELS[$idx]}"
+      SMALL_IDX=$idx
+      break
+    fi
+  done
+fi
+
+# Allow interactive override with numeric index for generative models
+if [ -t 0 ]; then
+  GEN_COUNT=${#GEN_INDICES[@]}
+  EMB_COUNT=${#EMB_INDICES[@]}
+  if [ $GEN_COUNT -gt 0 ]; then
+    log "Generative models (${GEN_COUNT}):"
+    for ((i=0; i<GEN_COUNT; i++)); do
+      log "    $(printf "%3d." $((i+1))) ${ALL_MODELS[${GEN_INDICES[$i]}]}"
+    done
+    log "Skip embeddings with ' (e.g. 'q' or 0): "
+    read -r opts
+    if ! [[ "$opts" == "q" || "$opts" == "0" ]]; then
+      # User wants generative
+      log "Select generative model index [1-${GEN_COUNT}]: "
+      opt_idx=1
+      read -r ans
+      [[ ! "$ans" =~ ^[0-9]+$ ]] && { log "Invalid"; exit 0; }
+      opt_idx=$((ans + 0))
+      if [[ $opt_idx -lt 1 || $opt_idx -gt $GEN_COUNT ]]; then
+        log "Invalid index (1-${GEN_COUNT})"
+        exit 0
+      fi
+      PRIMARY="${ALL_MODELS[${GEN_INDICES[$((opt_idx-1))]}]}"
+    else
+      # User chose embeddings for small_model
+      SMALL_IDX=$EMB_IDX=0
+      for ((i=0; i<${#EMB_INDICES[@]}; i++)); do
+        SMALL="${ALL_MODELS[${EMB_INDICES[$i]}]}"
+        EMB_IDX=$i
+        break
+      done
+      if [[ -z "$SMALL" ]]; then
+        SMALL="${ALL_MODELS[${PRIMARY_IDX}]}"; EMB_IDX=$PRIMARY_IDX
+      fi
+    fi
+  elif [ $EMB_COUNT -gt 0 ]; then
+    log "No generative models found, using embedding: ${ALL_MODELS[${EMB_INDICES[0]}]}"
+    PRIMARY="${ALL_MODELS[${EMB_INDICES[0]}]}"
+    SMALL="${ALL_MODELS[${EMB_INDICES[0]}]:-}"
+  fi
 fi
 
 # ── write config ──────────────────────────────────────────
