@@ -120,55 +120,45 @@ if [ -z "$MODELS" ]; then
   Raw response: $(echo "$RESPONSE" | head -c 200)"
 fi
 
-# ── display & select ─────────────────────────────────────
+# ── count models ──────────────────────────────────────────
 COUNT=$(echo "$MODELS" | grep -c . || true)
-log "Found ${COUNT} model(s):"
-i=0
-echo "$MODELS" | while read -r m; do
-  ((++i))
-  [ $i -eq 1 ] && first=1
-  printf "  \033[1;36m%02d.\033[0m %s\n" "$i" "$m"
-done && echo
 
-# ── detect model type via /api/show ───────────────────────────
-detect_type() {
+# ── inspect model via /api/show (type + tools) ───────────────
+inspect_model() {
   local m="$1"
   local host="$2"
 
   local resp
-  resp=$(curl -sS --max-time 5 \
+  resp=$(curl -sS --max-time 10 \
     -H "Content-Type: application/json" \
     -d "{\"model\": \"$m\"}" \
     "${host}/api/show" 2>/dev/null || true)
 
   if [ -z "$resp" ]; then
-    echo "unknown"
+    echo "unknown|no"
     return
   fi
 
-  local has_template
-  has_template=$(echo "$resp" | python3 -c "
+  echo "$resp" | python3 -c "
 import json, sys
 try:
     data = json.load(sys.stdin)
     t = data.get('template', '')
-    print('yes' if t and t.strip() else 'no')
+    has_tmpl = 'yes' if t and t.strip() else 'no'
+    has_tools = 'yes' if '.Tools' in t or '.ToolCalls' in t else 'no'
+    if has_tmpl == 'yes':
+        print('generative|' + has_tools)
+    else:
+        print('embedding|' + has_tools)
 except:
-    print('no')
-" 2>/dev/null || echo "no")
-
-  if [ "$has_template" = "yes" ]; then
-    echo "generative"
-  else
-    echo "embedding"
-  fi
+    print('unknown|no')
+" 2>/dev/null || echo "unknown|no"
 }
 
 # ── classify models ──────────────────────────────────────────
-log "Inspecting models via /api/show …"
-
 declare -a ALL_MODELS
 declare -a MODEL_TYPES
+declare -a MODEL_TOOLS
 
 while IFS= read -r m; do
   [ -z "$m" ] && continue
@@ -178,35 +168,32 @@ done <<< "$MODELS"
 total=${#ALL_MODELS[@]}
 for ((idx=0; idx<total; idx++)); do
   m="${ALL_MODELS[$idx]}"
-  printf "\033[1;32m›\033[0m [%02d/%02d] Checking %s …\r" "$((idx+1))" "$total" "$m" >&2
-  type=$(detect_type "$m" "$BASE_URL")
+  progress="\033[1;32m›\033[0m Inspecting models via /api/show … [%02d/%02d] %s\033[K"
+  printf "\r${progress}" "$((idx+1))" "$total" "$m" >&2
+  result=$(inspect_model "$m" "$BASE_URL")
+  IFS='|' read -r type tools <<< "$result"
   MODEL_TYPES+=("$type")
+  MODEL_TOOLS+=("$tools")
 done
-printf "\033[K" >&2
-echo >&2
+printf "\r\033[K" >&2
 
-log "Results:"
-for ((i=0; i<total; i++)); do
-  color="\033[1;36m"
-  [ "${MODEL_TYPES[$i]}" = "embedding" ] && color="\033[1;33m"
-  [ "${MODEL_TYPES[$i]}" = "unknown" ] && color="\033[1;31m"
-  printf "  ${color}%02d.\033[0m %s \033[2m(%s)\033[0m\n" \
-    "$((i+1))" "${ALL_MODELS[$i]}" "${MODEL_TYPES[$i]}"
-done
-echo >&2
-
-# ── group by type ────────────────────────────────────────────
+# ── group by type and tools ────────────────────────────────────
 GEN_INDICES=()
 EMB_INDICES=()
+TOOLS_INDICES=()
 for ((i=0; i<total; i++)); do
   case "${MODEL_TYPES[$i]}" in
-    generative) GEN_INDICES+=($i) ;;
-    *)          EMB_INDICES+=($i) ;;
+    generative)
+      GEN_INDICES+=($i)
+      [ "${MODEL_TOOLS[$i]}" = "yes" ] && TOOLS_INDICES+=($i)
+      ;;
+    *) EMB_INDICES+=($i) ;;
   esac
 done
 
 GEN_COUNT=${#GEN_INDICES[@]}
 EMB_COUNT=${#EMB_INDICES[@]}
+TOOLS_COUNT=${#TOOLS_INDICES[@]}
 
 # ── size helpers ──────────────────────────────────────────────
 get_size() {
@@ -273,7 +260,12 @@ select_small() {
 PRIMARY=""
 SMALL=""
 
-if [ $GEN_COUNT -gt 0 ]; then
+# Prefer tools-capable models for primary
+if [ $TOOLS_COUNT -gt 0 ]; then
+  PRIMARY=$(select_primary "${TOOLS_INDICES[@]}")
+  SMALL=$(select_small "$PRIMARY" "${TOOLS_INDICES[@]}")
+elif [ $GEN_COUNT -gt 0 ]; then
+  warn "No generative model supports tools — using all generative models"
   PRIMARY=$(select_primary "${GEN_INDICES[@]}")
   SMALL=$(select_small "$PRIMARY" "${GEN_INDICES[@]}")
 elif [ $EMB_COUNT -gt 0 ]; then
@@ -283,18 +275,33 @@ fi
 
 # ── interactive override ─────────────────────────────────────
 if [ -t 0 ] && [ $GEN_COUNT -gt 0 ]; then
-  echo >&2
-  log "Generative models:"
-  for ((i=0; i<GEN_COUNT; i++)); do
-    marker=""
-    [ "${ALL_MODELS[${GEN_INDICES[$i]}]}" = "$PRIMARY" ] && marker=" \033[1;32m← primary\033[0m"
-    log "    $(printf "%3d." $((i+1))) ${ALL_MODELS[${GEN_INDICES[$i]}]}${marker}"
-  done
-  log "Select primary model index [1-${GEN_COUNT}], or 0 to accept defaults: "
-  read -r ans
-  if [[ "$ans" =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le "$GEN_COUNT" ]; then
-    PRIMARY="${ALL_MODELS[${GEN_INDICES[$((ans-1))]}]}"
-    SMALL=$(select_small "$PRIMARY" "${GEN_INDICES[@]}")
+  if [ $TOOLS_COUNT -gt 0 ]; then
+    log "Models with tools:"
+    for ((i=0; i<TOOLS_COUNT; i++)); do
+      marker=""
+      [ "${ALL_MODELS[${TOOLS_INDICES[$i]}]}" = "$PRIMARY" ] && marker=" ←"
+      printf "  %d. %s${marker}\n" "$((i+1))" "${ALL_MODELS[${TOOLS_INDICES[$i]}]}" >&2
+    done
+    [ $((GEN_COUNT - TOOLS_COUNT)) -gt 0 ] && warn "$((GEN_COUNT - TOOLS_COUNT)) model(s) without tools (hidden)"
+    log "Select primary [1-${TOOLS_COUNT}], or 0 to accept: "
+    read -r ans
+    if [[ "$ans" =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le "$TOOLS_COUNT" ]; then
+      PRIMARY="${ALL_MODELS[${TOOLS_INDICES[$((ans-1))]}]}"
+      SMALL=$(select_small "$PRIMARY" "${TOOLS_INDICES[@]}")
+    fi
+  else
+    warn "Showing all generative models (none support tools)"
+    for ((i=0; i<GEN_COUNT; i++)); do
+      marker=""
+      [ "${ALL_MODELS[${GEN_INDICES[$i]}]}" = "$PRIMARY" ] && marker=" ←"
+      printf "  %d. %s${marker}\n" "$((i+1))" "${ALL_MODELS[${GEN_INDICES[$i]}]}" >&2
+    done
+    log "Select primary [1-${GEN_COUNT}], or 0 to accept: "
+    read -r ans
+    if [[ "$ans" =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le "$GEN_COUNT" ]; then
+      PRIMARY="${ALL_MODELS[${GEN_INDICES[$((ans-1))]}]}"
+      SMALL=$(select_small "$PRIMARY" "${GEN_INDICES[@]}")
+    fi
   fi
 fi
 
