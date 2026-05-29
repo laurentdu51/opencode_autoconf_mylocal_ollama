@@ -1,32 +1,44 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "instructions": [
-    "## Règles de mémoire de session",
-    "",
-    "À la fin de chaque session, mets à jour AGENTS.md avec :",
-    "- Les décisions importantes prises",
-    "- Les conventions établies",
-    "- L'état d'avancement des tâches",
-    "- Les nouveaux problèmes connus",
-    "Conserve l'historique sans tout effacer.",
-    "Utilise les sections existantes si elles conviennent.",
-    ""
-  ],
-  "model": "ollama-srv/qwen3.5:0.8b",
-  "small_model": "ollama-srv/llama3.2:1b",
+  "model": "ollama-srv/SetneufPT/ccode79_2b_q4_64k_8gb-gpu:latest",
+  "small_model": "ollama-srv/qwen3.5:0.8b",
   "provider": {
     "ollama-srv": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Ollama (rpi2)",
+      "name": "Ollama (PC-TV)",
       "options": {
-        "baseURL": "http://rpi2:11434/v1"
+        "baseURL": "http://PC-TV:11434/v1"
       },
       "models": {
+        "SetneufPT/ccode79_2b_q4_64k_8gb-gpu:latest": {
+          "name": "SetneufPT/ccode79_2b_q4_64k_8gb-gpu:latest"
+        },
+        "llama3.2:3b": {
+          "name": "llama3.2:3b"
+        },
+        "qwen3:8b": {
+          "name": "qwen3:8b"
+        },
+        "qwen2.5-coder:7b": {
+          "name": "qwen2.5-coder:7b"
+        },
+        "qwen3.5:4b": {
+          "name": "qwen3.5:4b"
+        },
+        "sorc/qwen3.5-claude-4.6-opus-q4:4b": {
+          "name": "sorc/qwen3.5-claude-4.6-opus-q4:4b"
+        },
+        "qwen3-vl:latest": {
+          "name": "qwen3-vl:latest"
+        },
         "qwen3.5:0.8b": {
           "name": "qwen3.5:0.8b"
         },
-        "llama3.2:1b": {
-          "name": "llama3.2:1b"
+        "qwen2.5-coder:1.5b": {
+          "name": "qwen2.5-coder:1.5b"
+        },
+        "codellama:latest": {
+          "name": "codellama:latest"
         }
       }
     }

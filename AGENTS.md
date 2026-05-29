@@ -23,8 +23,12 @@ L'agent doit le mettre à jour à la fin de chaque session avec les nouvelles in
 - (aucun pour l'instant)
 
 ## Architecture
-- `opencode.json` : config statique du provider Ollama
+- `opencode.json` : config statique du provider Ollama (inclut tous les modèles génératifs)
 - `ollama-opencode.sh` : scanne un hôte et génère la config dynamiquement
+  - Détection de type via `/api/show` (vérifie la présence d'un template de chat)
+  - Auto-sélection du modèle primaire : code (coder/ccode) > plus gros paramétrage
+  - Auto-sélection du petit modèle : plus petit paramétrage (modèles sans taille ignorés)
+  - Génère tous les modèles génératifs dans `opencode.json`
 - `AGENTS.md` : mémoire persistante entre sessions
 - `README.md` : documentation utilisateur
 

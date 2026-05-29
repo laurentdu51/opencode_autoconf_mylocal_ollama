@@ -130,171 +130,224 @@ echo "$MODELS" | while read -r m; do
   printf "  \033[1;36m%02d.\033[0m %s\n" "$i" "$m"
 done && echo
 
-# ── detect model type ────────────────────────────────────────────────
+# ── detect model type via /api/show ───────────────────────────
 detect_type() {
   local m="$1"
-  local name=$(clean_name "$m")
-  # Check model name patterns
-  if [[ "$name" =~ (llama|qwen|codellama|phi|granite|mistral) ]] && [[ "$name" != *embed* ]]; then
-    echo "generative"
-  elif [[ "$name" =~ (embed|nomic) ]]; then
-    echo "embedding"
-  elif [[ "$name" =~ coder ]]; then
+  local host="$2"
+
+  local resp
+  resp=$(curl -sS --max-time 5 \
+    -H "Content-Type: application/json" \
+    -d "{\"model\": \"$m\"}" \
+    "${host}/api/show" 2>/dev/null || true)
+
+  if [ -z "$resp" ]; then
+    echo "unknown"
+    return
+  fi
+
+  local has_template
+  has_template=$(echo "$resp" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    t = data.get('template', '')
+    print('yes' if t and t.strip() else 'no')
+except:
+    print('no')
+" 2>/dev/null || echo "no")
+
+  if [ "$has_template" = "yes" ]; then
     echo "generative"
   else
-    echo "ambiguous"
+    echo "embedding"
   fi
 }
 
-# ── classify models ───────────────────────────────────────────────────
-MODELS_WITH_TYPES=$(echo "$MODELS" | while read -r m; do echo "0\t$m"; done | paste -d'\t' <(seq 1 1))
-CLASSIFIED=$(echo "$MODELS_WITH_TYPES" | while IFS=$'\t' read -r idx m; do
-  type=$(detect_type "$m")
-  case "$type" in
-    generative) echo "$idx\tgenerative\t$m" ;;
-    embedding) echo "$idx\tembedding\t$m" ;;
-    *)         echo "$idx\tambiguous\t$m" ;;
-  esac
-done)
+# ── classify models ──────────────────────────────────────────
+log "Inspecting models via /api/show …"
 
-# ── build indexed array ───────────────────────────────────────────────
-declare -A TYPE_MAP
 declare -a ALL_MODELS
-idx=0
-while IFS=$'\t' read -r i type name; do
-  ALL_MODELS[$idx]="$name"
-  TYPE_MAP[$idx]="$type"
-  ((++idx))
-done <<< "$CLASSIFIED"
+declare -a MODEL_TYPES
 
-# ── select models ────────────────────────────────────────────────────
-# Generative model takes priority
+while IFS= read -r m; do
+  [ -z "$m" ] && continue
+  ALL_MODELS+=("$m")
+done <<< "$MODELS"
+
+total=${#ALL_MODELS[@]}
+for ((idx=0; idx<total; idx++)); do
+  m="${ALL_MODELS[$idx]}"
+  printf "\033[1;32m›\033[0m [%02d/%02d] Checking %s …\r" "$((idx+1))" "$total" "$m" >&2
+  type=$(detect_type "$m" "$BASE_URL")
+  MODEL_TYPES+=("$type")
+done
+printf "\033[K" >&2
+echo >&2
+
+log "Results:"
+for ((i=0; i<total; i++)); do
+  color="\033[1;36m"
+  [ "${MODEL_TYPES[$i]}" = "embedding" ] && color="\033[1;33m"
+  [ "${MODEL_TYPES[$i]}" = "unknown" ] && color="\033[1;31m"
+  printf "  ${color}%02d.\033[0m %s \033[2m(%s)\033[0m\n" \
+    "$((i+1))" "${ALL_MODELS[$i]}" "${MODEL_TYPES[$i]}"
+done
+echo >&2
+
+# ── group by type ────────────────────────────────────────────
 GEN_INDICES=()
 EMB_INDICES=()
-for ((i=0; i<${#ALL_MODELS[@]}; i++)); do
-  type="${TYPE_MAP[$i]}"
-  case "$type" in
+for ((i=0; i<total; i++)); do
+  case "${MODEL_TYPES[$i]}" in
     generative) GEN_INDICES+=($i) ;;
-    embedding) EMB_INDICES+=($i) ;;
+    *)          EMB_INDICES+=($i) ;;
   esac
 done
 
-# Auto-select primary: generative (prefer recent one)
-if [[ $GEN_COUNT -gt 0 ]]; then
-  # Prefer models with "3", "2", "latest" in the name (more recent)
-  best_idx=0
-  for ((i=0; i<GEN_COUNT; i++)); do
-    curr_idx=$i
-    [[ -z "${GEN_INDICES[$curr_idx]}" ]] && continue
-    curr="${ALL_MODELS[${GEN_INDICES[$curr_idx]}]}"
-    if [[ "$curr" == *"3"* || "$curr" == *"2"* || "$curr" == *"latest"* ]]; then
-      # Check if this is the best so far
-      best_idx=$curr_idx
+GEN_COUNT=${#GEN_INDICES[@]}
+EMB_COUNT=${#EMB_INDICES[@]}
+
+# ── size helpers ──────────────────────────────────────────────
+get_size() {
+  local name="$1"
+  local s
+  s=$(echo "$name" | grep -oE '[0-9]+\.?[0-9]*b' | head -1)
+  [ -z "$s" ] && echo "999" && return
+  echo "${s%b}"
+}
+
+# ── auto-select primary ──────────────────────────────────────
+select_primary() {
+  local -a indices=("$@")
+  local count=${#indices[@]}
+  [ $count -eq 0 ] && { echo ""; return; }
+
+  # Pass 1: code model (coder, ccode)
+  for idx in "${indices[@]}"; do
+    local name="${ALL_MODELS[$idx]}"
+    local clean="${name%":latest"}"
+    if [[ "$clean" =~ (coder|ccode) ]]; then
+      echo "${ALL_MODELS[$idx]}"
+      return
     fi
   done
-  PRIMARY="${ALL_MODELS[${GEN_INDICES[$best_idx]}]}"
-else
+
+  # Pass 2: largest by parameter size
+  local best_name="${ALL_MODELS[${indices[0]}]}"
+  local best_size=$(get_size "$best_name")
+  for idx in "${indices[@]}"; do
+    local name="${ALL_MODELS[$idx]}"
+    local size=$(get_size "$name")
+    if [ "$(echo "$size > $best_size" | bc -l 2>/dev/null)" = "1" ]; then
+      best_size="$size"
+      best_name="$name"
+    fi
+  done
+
+  echo "$best_name"
+}
+
+select_small() {
+  local primary="$1"
+  shift
+  local -a indices=("$@")
+  local count=${#indices[@]}
+
+  local small=""
+  local small_size="9999"
+  for idx in "${indices[@]}"; do
+    local name="${ALL_MODELS[$idx]}"
+    [ "$name" = "$primary" ] && continue
+    local size=$(get_size "$name")
+    if [ "$(echo "$size < $small_size" | bc -l 2>/dev/null)" = "1" ]; then
+      small_size="$size"
+      small="$name"
+    fi
+  done
+
+  [ -z "$small" ] && small="$primary"
+  echo "$small"
+}
+
+PRIMARY=""
+SMALL=""
+
+if [ $GEN_COUNT -gt 0 ]; then
+  PRIMARY=$(select_primary "${GEN_INDICES[@]}")
+  SMALL=$(select_small "$PRIMARY" "${GEN_INDICES[@]}")
+elif [ $EMB_COUNT -gt 0 ]; then
   PRIMARY="${ALL_MODELS[${EMB_INDICES[0]}]}"
+  SMALL="$PRIMARY"
 fi
 
-# Select small: generative if possible, otherwise from embedding
-SMALL_MODEL=""
-SMALL_IDX=-1
-for ((i=0; i<${#GEN_INDICES[@]}; i++)); do
-  idx=${GEN_INDICES[$i]}
-  if [[ $idx -ne $PRIMARY_IDX ]]; then
-    SMALL="${ALL_MODELS[$idx]}"
-    SMALL_IDX=$idx
-    break
-  fi
-done
-if [[ -z "$SMALL" ]] || [[ -1 == $SMALL_IDX ]]; then
-  for ((i=0; i<${#EMB_INDICES[@]}; i++)); do
-    idx=$i
-    if [[ -z "$SMALL" ]]; then
-      SMALL="${ALL_MODELS[$idx]}"
-      SMALL_IDX=$idx
-      break
-    fi
+# ── interactive override ─────────────────────────────────────
+if [ -t 0 ] && [ $GEN_COUNT -gt 0 ]; then
+  echo >&2
+  log "Generative models:"
+  for ((i=0; i<GEN_COUNT; i++)); do
+    marker=""
+    [ "${ALL_MODELS[${GEN_INDICES[$i]}]}" = "$PRIMARY" ] && marker=" \033[1;32m← primary\033[0m"
+    log "    $(printf "%3d." $((i+1))) ${ALL_MODELS[${GEN_INDICES[$i]}]}${marker}"
   done
-fi
-
-# Allow interactive override with numeric index for generative models
-if [ -t 0 ]; then
-  GEN_COUNT=${#GEN_INDICES[@]}
-  EMB_COUNT=${#EMB_INDICES[@]}
-  if [ $GEN_COUNT -gt 0 ]; then
-    log "Generative models (${GEN_COUNT}):"
-    for ((i=0; i<GEN_COUNT; i++)); do
-      log "    $(printf "%3d." $((i+1))) ${ALL_MODELS[${GEN_INDICES[$i]}]}"
-    done
-    log "Skip embeddings with ' (e.g. 'q' or 0): "
-    read -r opts
-    if ! [[ "$opts" == "q" || "$opts" == "0" ]]; then
-      # User wants generative
-      log "Select generative model index [1-${GEN_COUNT}]: "
-      opt_idx=1
-      read -r ans
-      [[ ! "$ans" =~ ^[0-9]+$ ]] && { log "Invalid"; exit 0; }
-      opt_idx=$((ans + 0))
-      if [[ $opt_idx -lt 1 || $opt_idx -gt $GEN_COUNT ]]; then
-        log "Invalid index (1-${GEN_COUNT})"
-        exit 0
-      fi
-      PRIMARY="${ALL_MODELS[${GEN_INDICES[$((opt_idx-1))]}]}"
-    else
-      # User chose embeddings for small_model
-      SMALL_IDX=$EMB_IDX=0
-      for ((i=0; i<${#EMB_INDICES[@]}; i++)); do
-        SMALL="${ALL_MODELS[${EMB_INDICES[$i]}]}"
-        EMB_IDX=$i
-        break
-      done
-      if [[ -z "$SMALL" ]]; then
-        SMALL="${ALL_MODELS[${PRIMARY_IDX}]}"; EMB_IDX=$PRIMARY_IDX
-      fi
-    fi
-  elif [ $EMB_COUNT -gt 0 ]; then
-    log "No generative models found, using embedding: ${ALL_MODELS[${EMB_INDICES[0]}]}"
-    PRIMARY="${ALL_MODELS[${EMB_INDICES[0]}]}"
-    SMALL="${ALL_MODELS[${EMB_INDICES[0]}]:-}"
+  log "Select primary model index [1-${GEN_COUNT}], or 0 to accept defaults: "
+  read -r ans
+  if [[ "$ans" =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le "$GEN_COUNT" ]; then
+    PRIMARY="${ALL_MODELS[${GEN_INDICES[$((ans-1))]}]}"
+    SMALL=$(select_small "$PRIMARY" "${GEN_INDICES[@]}")
   fi
 fi
 
 # ── write config ──────────────────────────────────────────
 log "Generating ${CONFIG_FILE} …"
 
-cat > "$CONFIG_FILE" <<CONFEOF
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "model": "${PROVIDER_ID}/${PRIMARY}",
-  "small_model": "${PROVIDER_ID}/${SMALL}",
-  "provider": {
-    "${PROVIDER_ID}": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "${PROVIDER_NAME}",
-      "options": {
-        "baseURL": "${BASE_URL}/v1"
-      },
-      "models": {
-        "${PRIMARY}": {
-          "name": "${PRIMARY}"
-        },
-        "${SMALL}": {
-          "name": "${SMALL}"
+MODELS_TMP=$(mktemp)
+trap "rm -f $MODELS_TMP" EXIT
+for ((i=0; i<total; i++)); do
+  if [ "${MODEL_TYPES[$i]}" = "generative" ]; then
+    echo "${ALL_MODELS[$i]}" >> "$MODELS_TMP"
+  fi
+done
+
+export OC_PROVIDER_ID="$PROVIDER_ID"
+export OC_PROVIDER_NAME="$PROVIDER_NAME"
+export OC_BASE_URL="${BASE_URL}/v1"
+export OC_PRIMARY="$PRIMARY"
+export OC_SMALL="$SMALL"
+export OC_MODELS_FILE="$MODELS_TMP"
+
+python3 -c "
+import json, os
+
+with open(os.environ['OC_MODELS_FILE']) as f:
+    models = [line.strip() for line in f if line.strip()]
+
+config = {
+    '\$schema': 'https://opencode.ai/config.json',
+    'model': os.environ['OC_PROVIDER_ID'] + '/' + os.environ['OC_PRIMARY'],
+    'small_model': os.environ['OC_PROVIDER_ID'] + '/' + os.environ['OC_SMALL'],
+    'provider': {
+        os.environ['OC_PROVIDER_ID']: {
+            'npm': '@ai-sdk/openai-compatible',
+            'name': os.environ['OC_PROVIDER_NAME'],
+            'options': {
+                'baseURL': os.environ['OC_BASE_URL']
+            },
+            'models': {m: {'name': m} for m in models}
         }
-      }
     }
-  }
 }
-CONFEOF
+
+print(json.dumps(config, indent=2))
+" > "$CONFIG_FILE"
 
 log "Wrote ${CONFIG_FILE}"
 echo "  model:       ${PROVIDER_ID}/${PRIMARY}" >&2
 echo "  small_model: ${PROVIDER_ID}/${SMALL}" >&2
 echo "  baseURL:     ${BASE_URL}/v1" >&2
 echo "  provider:    ${PROVIDER_NAME}" >&2
-echo
+echo "  models in config: all generative models" >&2
+echo >&2
 
 # ── launch ────────────────────────────────────────────────
 if [ "$LAUNCH" = true ]; then
