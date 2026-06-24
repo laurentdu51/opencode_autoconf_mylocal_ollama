@@ -86,7 +86,6 @@ log "Scanning Ollama at ${BASE_URL} …"
 RESPONSE=$(curl -sS --max-time 10 "${BASE_URL}/api/tags" 2>/dev/null || true)
 
 if [ -z "$RESPONSE" ]; then
-  # Fallback: try https
   BASE_URL="https://${OLLAMA_HOST}"
   RESPONSE=$(curl -sS --max-time 10 "${BASE_URL}/api/tags" 2>/dev/null || true)
 fi
@@ -98,32 +97,74 @@ if [ -z "$RESPONSE" ]; then
   ─ Verify network connectivity (firewall / VPN)"
 fi
 
-# Parse model names from JSON response using python3 or jq
-MODELS=$(
+# Parse model info from /api/tags: name|has_completion|has_tools|size_gb
+# Uses capabilities[] when available (Ollama ≥0.6), else "unknown"
+# Extracts size from details.parameter_size (e.g. "8.0B", "873.44M")
+MODELS_DATA=$(
   echo "$RESPONSE" | python3 -c "
-import json, sys
+import json, sys, re
+
+def parse_size(param_size):
+    if not param_size:
+        return ''
+    param_size = param_size.strip()
+    m = re.match(r'([0-9]+(?:\\.[0-9]+)?)\\s*([BbMm])', param_size)
+    if not m:
+        return ''
+    val = float(m.group(1))
+    unit = m.group(2).lower()
+    if unit == 'm':
+        val = val / 1000
+    return f'{val:.4f}'
+
 data = json.load(sys.stdin)
 for m in data.get('models', []):
-    # skip remote-only models (they have a remote_host)
-    if 'remote_host' not in m:
-        print(m['name'])
+    if 'remote_host' in m:
+        continue
+    name = m['name']
+    caps = m.get('capabilities', None)
+    has_comp = 'unknown'
+    has_tools = 'unknown'
+    if caps is not None and isinstance(caps, list):
+        has_comp = 'yes' if 'completion' in caps else 'no'
+        has_tools = 'yes' if 'tools' in caps else 'no'
+    size = parse_size(m.get('details', {}).get('parameter_size', ''))
+    print(f'{name}|{has_comp}|{has_tools}|{size}')
   " 2>/dev/null
 )
 
-if [ -z "$MODELS" ]; then
-  # fallback: try jq
-  MODELS=$(echo "$RESPONSE" | jq -r '.models[] | select(.remote_host | not) | .name' 2>/dev/null || true)
+if [ -z "$MODELS_DATA" ]; then
+  MODELS_DATA=$(echo "$RESPONSE" | jq -r '.models[] | select(.remote_host | not) | "\(.name)|\(if .capabilities then if .capabilities | index("completion") then "yes" else "no" end else "unknown" end)|\(if .capabilities then if .capabilities | index("tools") then "yes" else "no" end else "unknown" end)|\(.details.parameter_size // "")"' 2>/dev/null || true)
 fi
 
-if [ -z "$MODELS" ]; then
-  err "No local models found at ${BASE_URL}
+if [ -z "$MODELS_DATA" ]; then
+  err "No models found at ${BASE_URL}
   Raw response: $(echo "$RESPONSE" | head -c 200)"
 fi
 
-# ── count models ──────────────────────────────────────────
-COUNT=$(echo "$MODELS" | grep -c . || true)
+# ── parse into arrays ─────────────────────────────────────
+declare -a ALL_MODELS MODEL_TYPES MODEL_TOOLS MODEL_SIZES
+while IFS='|' read -r name has_comp has_tools size_gb; do
+    [ -z "$name" ] && continue
+    ALL_MODELS+=("$name")
+    if [ "$has_comp" = "yes" ]; then
+        MODEL_TYPES+=("generative")
+    elif [ "$has_comp" = "no" ]; then
+        MODEL_TYPES+=("embedding")
+    else
+        MODEL_TYPES+=("unknown")
+    fi
+    if [ "$has_tools" = "yes" ]; then
+        MODEL_TOOLS+=("yes")
+    else
+        MODEL_TOOLS+=("no")
+    fi
+    MODEL_SIZES+=("$size_gb")
+done <<< "$MODELS_DATA"
 
-# ── inspect model via /api/show (type + tools) ───────────────
+total=${#ALL_MODELS[@]}
+
+# ── fallback: inspect unknown models via /api/show ────────
 inspect_model() {
   local m="$1"
   local host="$2"
@@ -155,29 +196,27 @@ except:
 " 2>/dev/null || echo "unknown|no"
 }
 
-# ── classify models ──────────────────────────────────────────
-declare -a ALL_MODELS
-declare -a MODEL_TYPES
-declare -a MODEL_TOOLS
-
-while IFS= read -r m; do
-  [ -z "$m" ] && continue
-  ALL_MODELS+=("$m")
-done <<< "$MODELS"
-
-total=${#ALL_MODELS[@]}
-for ((idx=0; idx<total; idx++)); do
-  m="${ALL_MODELS[$idx]}"
-  progress="\033[1;32m›\033[0m Inspecting models via /api/show … [%02d/%02d] %s\033[K"
-  printf "\r${progress}" "$((idx+1))" "$total" "$m" >&2
-  result=$(inspect_model "$m" "$BASE_URL")
-  IFS='|' read -r type tools <<< "$result"
-  MODEL_TYPES+=("$type")
-  MODEL_TOOLS+=("$tools")
+NEEDS_INSPECT=false
+for ((i=0; i<total; i++)); do
+    [ "${MODEL_TYPES[$i]}" = "unknown" ] && { NEEDS_INSPECT=true; break; }
 done
-printf "\r\033[K" >&2
 
-# ── group by type and tools ────────────────────────────────────
+if [ "$NEEDS_INSPECT" = true ]; then
+    log "Some models missing capabilities — inspecting via /api/show …"
+    for ((idx=0; idx<total; idx++)); do
+        [ "${MODEL_TYPES[$idx]}" != "unknown" ] && continue
+        m="${ALL_MODELS[$idx]}"
+        progress="\033[1;32m›\033[0m /api/show [%02d/%02d] %s\033[K"
+        printf "\r${progress}" "$((idx+1))" "$total" "$m" >&2
+        result=$(inspect_model "$m" "$BASE_URL")
+        IFS='|' read -r type tools <<< "$result"
+        MODEL_TYPES[$idx]="$type"
+        MODEL_TOOLS[$idx]="$tools"
+    done
+    printf "\r\033[K" >&2
+fi
+
+# ── group by type and tools ──────────────────────────────
 GEN_INDICES=()
 EMB_INDICES=()
 TOOLS_INDICES=()
@@ -195,58 +234,98 @@ GEN_COUNT=${#GEN_INDICES[@]}
 EMB_COUNT=${#EMB_INDICES[@]}
 TOOLS_COUNT=${#TOOLS_INDICES[@]}
 
-# ── size helpers ──────────────────────────────────────────────
-get_size() {
-  local name="$1"
+# ── size helper (returns GB as float) ─────────────────────
+get_size_gb() {
+  local idx=$1
+  local fallback_size
+  fallback_size="${MODEL_SIZES[$idx]}"
+  if [ -n "$fallback_size" ]; then
+    echo "$fallback_size"
+    return
+  fi
+  # Fallback: parse model name
+  local name="${ALL_MODELS[$idx]}"
+  name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
   local s
-  s=$(echo "$name" | grep -oE '[0-9]+\.?[0-9]*b' | head -1)
+  s=$(echo "$name" | grep -oE '[0-9]+\.?[0-9]*[bm]' | head -1)
   [ -z "$s" ] && echo "999" && return
-  echo "${s%b}"
+  local unit="${s: -1}"
+  s="${s%[bm]}"
+  case "$unit" in
+    m) echo "scale=4; $s / 1000" | bc -l 2>/dev/null || echo "999" ;;
+    *) echo "$s" ;;
+  esac
 }
 
-# ── auto-select primary ──────────────────────────────────────
-select_primary() {
+# ── scoring-based selection ───────────────────────────────
+# Scores a model by capabilities, type, and size.
+score_model() {
+  local idx=$1
+  local name="${ALL_MODELS[$idx]}"
+  local tools="${MODEL_TOOLS[$idx]}"
+
+  local score=0
+
+  # Tools support: biggest bonus
+  [ "$tools" = "yes" ] && score=$((score + 20))
+
+  # Code model bonus
+  local clean="${name%":latest"}"
+  if [[ "$clean" =~ (coder|ccode) ]]; then
+    score=$((score + 5))
+  fi
+
+  # Hermes bonus (known for reliable tool calling)
+  if [[ "$clean" =~ hermes ]]; then
+    score=$((score + 5))
+  fi
+
+  # Size bonus: up to +10 (capped at ~10B params)
+  local size
+  size=$(get_size_gb "$idx")
+  local size_int
+  size_int=$(echo "$size / 1" | bc -l 2>/dev/null | cut -d. -f1)
+  : "${size_int:=0}"
+  [ "$size_int" -gt 10 ] && size_int=10
+  score=$((score + size_int))
+
+  echo "$score"
+}
+
+# Select the best model from a set of indices by score
+select_best() {
   local -a indices=("$@")
   local count=${#indices[@]}
   [ $count -eq 0 ] && { echo ""; return; }
 
-  # Pass 1: code model (coder, ccode)
+  local best_idx="${indices[0]}"
+  local best_score=0
+  local current_score
+
   for idx in "${indices[@]}"; do
-    local name="${ALL_MODELS[$idx]}"
-    local clean="${name%":latest"}"
-    if [[ "$clean" =~ (coder|ccode) ]]; then
-      echo "${ALL_MODELS[$idx]}"
-      return
+    current_score=$(score_model "$idx")
+    if [ "$current_score" -gt "$best_score" ]; then
+      best_score="$current_score"
+      best_idx="$idx"
     fi
   done
 
-  # Pass 2: largest by parameter size
-  local best_name="${ALL_MODELS[${indices[0]}]}"
-  local best_size=$(get_size "$best_name")
-  for idx in "${indices[@]}"; do
-    local name="${ALL_MODELS[$idx]}"
-    local size=$(get_size "$name")
-    if [ "$(echo "$size > $best_size" | bc -l 2>/dev/null)" = "1" ]; then
-      best_size="$size"
-      best_name="$name"
-    fi
-  done
-
-  echo "$best_name"
+  echo "${ALL_MODELS[$best_idx]}"
 }
 
+# Select the smallest model from a set (excluding primary)
 select_small() {
   local primary="$1"
   shift
   local -a indices=("$@")
-  local count=${#indices[@]}
 
   local small=""
   local small_size="9999"
   for idx in "${indices[@]}"; do
     local name="${ALL_MODELS[$idx]}"
     [ "$name" = "$primary" ] && continue
-    local size=$(get_size "$name")
+    local size
+    size=$(get_size_gb "$idx")
     if [ "$(echo "$size < $small_size" | bc -l 2>/dev/null)" = "1" ]; then
       small_size="$size"
       small="$name"
@@ -257,36 +336,58 @@ select_small() {
   echo "$small"
 }
 
+# Sort indices by score descending (for display)
+sort_by_score() {
+  local -a indices=("$@")
+  local -a scored
+  for idx in "${indices[@]}"; do
+    local s
+    s=$(score_model "$idx")
+    scored+=("$s|$idx")
+  done
+  IFS=$'\n' sorted=($(sort -t'|' -k1 -rn <<< "${scored[*]}"))
+  unset IFS
+  for entry in "${sorted[@]}"; do
+    echo "${entry#*|}"
+  done
+}
+
 PRIMARY=""
 SMALL=""
 
 # Prefer tools-capable models for primary
 if [ $TOOLS_COUNT -gt 0 ]; then
-  PRIMARY=$(select_primary "${TOOLS_INDICES[@]}")
+  PRIMARY=$(select_best "${TOOLS_INDICES[@]}")
   SMALL=$(select_small "$PRIMARY" "${TOOLS_INDICES[@]}")
 elif [ $GEN_COUNT -gt 0 ]; then
   warn "No generative model supports tools — using all generative models"
-  PRIMARY=$(select_primary "${GEN_INDICES[@]}")
+  PRIMARY=$(select_best "${GEN_INDICES[@]}")
   SMALL=$(select_small "$PRIMARY" "${GEN_INDICES[@]}")
 elif [ $EMB_COUNT -gt 0 ]; then
   PRIMARY="${ALL_MODELS[${EMB_INDICES[0]}]}"
   SMALL="$PRIMARY"
 fi
 
-# ── interactive override ─────────────────────────────────────
+# ── interactive override ─────────────────────────────────
 if [ -t 0 ] && [ $GEN_COUNT -gt 0 ]; then
   if [ $TOOLS_COUNT -gt 0 ]; then
-    log "Models with tools:"
+    log "Models with tools (sorted by score):"
+    declare -a SORTED_TOOLS
+    SORTED_TOOLS=($(sort_by_score "${TOOLS_INDICES[@]}"))
     for ((i=0; i<TOOLS_COUNT; i++)); do
+      idx="${SORTED_TOOLS[$i]}"
+      name="${ALL_MODELS[$idx]}"
+      s=$(score_model "$idx")
       marker=""
-      [ "${ALL_MODELS[${TOOLS_INDICES[$i]}]}" = "$PRIMARY" ] && marker=" ←"
-      printf "  %d. %s${marker}\n" "$((i+1))" "${ALL_MODELS[${TOOLS_INDICES[$i]}]}" >&2
+      [ "$name" = "$PRIMARY" ] && marker=" ←"
+      printf "  %d. [%02d] %s${marker}\n" "$((i+1))" "$s" "$name" >&2
     done
     [ $((GEN_COUNT - TOOLS_COUNT)) -gt 0 ] && warn "$((GEN_COUNT - TOOLS_COUNT)) model(s) without tools (hidden)"
     log "Select primary [1-${TOOLS_COUNT}], or 0 to accept: "
     read -r ans
     if [[ "$ans" =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le "$TOOLS_COUNT" ]; then
-      PRIMARY="${ALL_MODELS[${TOOLS_INDICES[$((ans-1))]}]}"
+      selected_idx="${SORTED_TOOLS[$((ans-1))]}"
+      PRIMARY="${ALL_MODELS[$selected_idx]}"
       SMALL=$(select_small "$PRIMARY" "${TOOLS_INDICES[@]}")
     fi
   else

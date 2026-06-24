@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "ollama-srv/SetneufPT/ccode79_2b_q4_64k_8gb-gpu:latest",
+  "model": "ollama-srv/gemma4-hermes:latest",
   "small_model": "ollama-srv/qwen3.5:0.8b",
   "provider": {
     "ollama-srv": {
@@ -10,8 +10,14 @@
         "baseURL": "http://PC-TV:11434/v1"
       },
       "models": {
-        "SetneufPT/ccode79_2b_q4_64k_8gb-gpu:latest": {
-          "name": "SetneufPT/ccode79_2b_q4_64k_8gb-gpu:latest"
+        "nemotron-3-nano:4b": {
+          "name": "nemotron-3-nano:4b"
+        },
+        "gemma4-hermes:latest": {
+          "name": "gemma4-hermes:latest"
+        },
+        "gemma4:latest": {
+          "name": "gemma4:latest"
         },
         "llama3.2:3b": {
           "name": "llama3.2:3b"
@@ -36,9 +42,6 @@
         },
         "qwen2.5-coder:1.5b": {
           "name": "qwen2.5-coder:1.5b"
-        },
-        "codellama:latest": {
-          "name": "codellama:latest"
         }
       }
     }
